@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+import asyncio
+from urllib import response
+from tcp import Servidor
+import re
+from collections import defaultdict
+
+apelidos = {}
+conexoes = {}
+canais = {}
+participantes = {}
+
+def validar_nome(nome):
+    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
+
+def validar_canal(nome):
+    return nome.startswith(b'#') and validar_nome(nome[1:])
+
+
+def sair(conexao):  # Função sair envia a mensagem a todos os usuarios em pelo menos um canal em comum
+    pessoas_avisadas = defaultdict(lambda : False)
+    try:
+        for canal in participantes[apelidos[conexao]]: # Visita todos os canais da pessoa
+            # Remove a pessoa dos canais 
+            canais[canal].remove(apelidos[conexao])
+            for pessoa in canais[canal]: # Avisando as pessoas que a conexao saiu
+                if not pessoas_avisadas[pessoa.lower()]:
+                    response = b':%s QUIT :Connection closed\r\n' % apelidos[conexao]
+                    conexoes[pessoa.lower()].enviar(response)
+                    pessoas_avisadas[pessoa.lower()] = True
+        # Limpa a key de seu apelido em participantes
+        del participantes[apelidos[conexao]]
+        # Limpa sua conexão do dict de conexoes
+        del conexoes[apelidos[conexao].lower()]
+        # Limpa seu apelido do dict de apelidos
+        del apelidos[conexao]
+    except:
+        pass
+    
+    print(conexao, 'conexão fechada')
+    conexao.fechar()
+
+buffer = ""
+
+def processa_dados(conexao, s):
+    global buffer    
+    for i in s:
+        buffer += i
+        if(buffer.endswith('\n')):
+            executa_comando(conexao, bytes(buffer, "utf-8"))
+            buffer = ""
+    return buffer
+
+def nome_canal(destinatario):
+    for canal in canais.keys(): # Verifica nome do canal para prevenir erros de acesso
+        if destinatario.lower() == canal.lower():
+            destinatario = canal
+    return destinatario
+
+def dados_recebidos(conexao, dados):
+    recebido = dados.decode("utf-8")
+    
+    if dados == b'':
+        return sair(conexao)
+    # Tratamento de buffering para dados não inteiros recebidos, por meio do proprio recv
+    #### NÃO RESOLVIDO porém desnecessário
+    # conexao.s.send(bytes(processa_dados(conexao,recebido), "utf-8"))
+    processa_dados(conexao,recebido)
+
+    print(conexao, dados)
+
+# Aqui todos os comandos serão executados
+def executa_comando(conexao, comando):
+    if comando.startswith(b'PING '): # Comando Ping
+        payload =  comando.split(b' ')[1] #
+        response = b':server PONG server :%s' % payload 
+    
+    elif comando.startswith(b'NICK '): # Comando Nick
+        nickname =  comando.split(b' ')[1]
+        nickname = nickname.split(b'\r')[0]
+        valido = validar_nome(nickname)
+        nick_atual = b'*' # Caso esteja criando a conta
+        
+        if(conexao in apelidos.keys()):
+            nick_atual = apelidos[conexao] # Caso esteja trocando o nick
+        
+        if not valido:
+            response = b':server 432 %s %s :Erroneous nickname\r\n' % (nick_atual, nickname) # Caso não seja um nome valido
+        
+        elif nome_usado(nickname):
+            response = b':server 433 %s %s :Nickname is already in use\r\n' % (nick_atual, nickname) # Caso usuario utilizado
+        
+        else:
+            if(conexao in apelidos.keys()): # Caso o nome seja disponivel e já sou usuário
+                del conexoes[apelidos[conexao].lower()] 
+                response = b':%s NICK %s\r\n' % (apelidos[conexao], nickname)
+                pessoas_avisadas = defaultdict(lambda : False)
+                try:
+                    for canal in participantes[apelidos[conexao]]: # Visita todos os canais da pessoa
+                        # Remove a pessoa dos canais 
+                        canais[canal].remove(apelidos[conexao])
+                        for pessoa in canais[canal]: # Avisando as pessoas que a conexao saiu
+                            if not pessoas_avisadas[pessoa.lower()]:
+                                conexoes[pessoa.lower()].enviar(response)
+                                pessoas_avisadas[pessoa.lower()] = True
+                        # Colocar o apelido novo nos canais
+                        canais[canal].append(nickname)
+                    # Troca a key de seu apelido em participantes
+                    participantes[nickname] = participantes[apelidos[conexao]] 
+                    del participantes[apelidos[conexao]]
+                except:
+                    pass
+                apelidos[conexao] = nickname # Dicionario para acessar nome da conexao
+                conexoes[nickname.lower()] = conexao # Dicionario para acessar conexao dado um nome ignorando Mai/min letras
+                conexoes[nickname.lower()].enviar(response)
+                return
+                        
+            else: # Caso o nome seja disponivel e sou novo
+                response = b':server 001 %s :Welcome\r\n:server 422 %s :MOTD File is missing\r\n' % (nickname, nickname) 
+            apelidos[conexao] = nickname # Dicionario para acessar nome da conexao
+            conexoes[nickname.lower()] = conexao # Dicionario para acessar conexao dado um nome ignorando Mai/min letras
+    
+    elif comando.startswith(b'PRIVMSG '): # Comando Privmsg
+        remetente = apelidos[conexao]
+        destinatario = comando.split(b' ')[1]
+        conteudo = comando.split(b' ')[2]
+
+        if not comando.split(b' ')[1].startswith(b'#'): #Caso seja mensagem a uma pessoa
+            if destinatario.lower() not in  conexoes.keys():
+                return
+            response = b':%s PRIVMSG %s %s' % (remetente, apelidos[conexoes[destinatario.lower()]], conteudo) # Garante impressão correta do usuario
+            conexoes[destinatario.lower()].enviar(response)
+            return
+
+        # Caso seja mensagem a um canal
+        destinatario = nome_canal(destinatario) # Busca o nome correto do canal ignorando Mai/min letras
+        
+        if remetente.lower() not in [x.lower() for x in canais[destinatario]]: # Verifica se a pessoa está no canal que vai enviar a mensagem
+            return
+        
+        response = b':%s PRIVMSG %s %s' % (remetente, destinatario, conteudo)
+        for pessoa in canais[destinatario]: #Envia mensagem a todas as pessoas do canal
+            if(pessoa.lower() != remetente.lower()):
+                conexoes[pessoa.lower()].enviar(response)
+        return
+
+    elif comando.startswith(b'JOIN '): # Comando Join
+        canal = comando.split(b' ')[1]
+        canal = canal.split(b'\r')[0]
+        
+        if not validar_canal(canal): # Caso o nome do canal não seja válido
+            response = b':server 403 %s :No such channel\r\n' % canal
+        
+        else: #Caso o nome do canal seja válido
+            if not canal.lower() in [x.lower() for x in canais.keys()]: # Caso esteja criando o canal
+                canais[canal] = []
+            canais[canal].append(apelidos[conexao])
+            if not apelidos[conexao] in participantes.keys(): # Caso o usuario não tinha canal
+                participantes[apelidos[conexao]] = []
+            participantes[apelidos[conexao]].append(canal)
+            response = b':%s JOIN :%s\r\n' % (apelidos[conexao], canal)
+
+            for membro in canais[canal]: # Envia a notificação a todos no canal
+                conexoes[membro.lower()].enviar(response)
+
+            # Envia a lista de membros
+            response = b':server 353 %s = %s :' %(apelidos[conexao], canal)
+            membros = canais[canal]
+            membros.sort() # Ordena em ordem alfabética todos os membros
+            mensagem = response
+            for membro in membros: # Pega todos os membros e adiciona a mensagem
+                if len(membro) + len(mensagem) + 1 <= 510: # Adiciona membros na mensagem enquanto caiba no limite de 510 caracteres (\r\n == 2)
+                    mensagem += membro + b' '
+                else: # Caso não caiba o membro na mensagem
+                    conexao.enviar(mensagem + b'\r\n')
+                    mensagem = response + membro
+            if(mensagem != response):
+                conexao.enviar(mensagem + b'\r\n')
+            conexao.enviar(b':server 366 %s %s :End of /NAMES list.\r\n' % (apelidos[conexao], canal))
+            return
+        
+    elif comando.startswith(b'PART '): # Comando Part
+        canal = comando.split(b' ')[1]
+        canal = canal.split(b'\r')[0]
+        canal = nome_canal(canal) # Busca o nome correto do canal ignorando Mai/min letras
+
+        if apelidos[conexao].lower() not in [x.lower() for x in canais[canal]]: # Caso o usuario não esteja no canal
+            return
+        
+        response = b':%s PART %s\r\n' % (apelidos[conexao], canal)
+
+        for membro in canais[canal]: # Envia a mensagem de saida para todos no canal
+            conexoes[membro.lower()].enviar(response)
+        
+        canais[canal].remove(apelidos[conexao]) # Remove o usuario do canal
+        return
+    conexao.enviar(response)
+
+
+def nome_usado(name):
+    if name.lower() in conexoes.keys():
+            return True
+    return False
+
+def conexao_aceita(conexao):
+    print(conexao, 'nova conexão')
+    conexao.registrar_recebedor(dados_recebidos)
+
+
+servidor = Servidor(6667)
+servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
+asyncio.get_event_loop().run_forever()
